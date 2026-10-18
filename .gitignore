@@ -1,1 +1,12 @@
 node_modules
+.vercel
+dist
+.output
+artifacts
+attachments
+screenshots
+data/loss-reports.json
+.grok/preview.log
+.grok/og-raw.png
+.grok/banner-raw.png
+.grok/skills
