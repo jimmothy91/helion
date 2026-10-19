@@ -248,7 +248,8 @@ export function botLine(factionId: number): string {
   return botVars(factionId, "even").line;
 }
 
-export const REPORT_BUILD = "1";
+/** Card stamp. First number: player rules. Second: bots. Third: a fix that should not change a match. */
+export const REPORT_BUILD = "1.1.0";
 
 export type LossCard = {
   factionId: number;
