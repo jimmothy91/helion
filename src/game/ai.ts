@@ -539,6 +539,111 @@ type Upgrade = {
 
 type Mood = "expand" | "fortify" | "hunt";
 
+/** Kill switch. False skips the lump, the rival nudge, and the telegraph. */
+export const botAdditions = { enabled: true };
+
+type Wind = { fromId: string; to: string; amount: number; roi: number; left: number };
+
+function windTicks(skill: Skill): number {
+  if (!botAdditions.enabled) return 0;
+  if (skill === "cautious") return 3;
+  if (skill === "relentless") return 1;
+  return 2;
+}
+
+/** Another rival already sits near you, and this bot has a legal hit on a rival. */
+function nudgeRival(window: Upgrade[], match: MatchState, factionId: number, time: number) {
+  if (!botAdditions.enabled) return;
+  const yours: { x: number; y: number }[] = [];
+  const theirs: { x: number; y: number }[] = [];
+  for (const d of match.defs) {
+    const owner = match.planets[d.id]?.owner;
+    const at = planetWorld(d, time, false);
+    if (owner === PLAYER_ID) yours.push(at);
+    else if (owner != null && owner > 0 && owner !== factionId) theirs.push(at);
+  }
+  let near = false;
+  for (const a of yours) {
+    for (const b of theirs) {
+      if (Math.hypot(a.x - b.x, a.y - b.y) < 560) near = true;
+    }
+  }
+  if (!near) return;
+  if (!window.some((u) => u.kind === "take" && u.victim > 0 && u.victim !== PLAYER_ID)) return;
+  for (const u of window) {
+    if (u.kind === "take" && u.victim === PLAYER_ID) u.roi *= 0.85;
+  }
+}
+
+/**
+ * After the old chooser has already picked. A partial take waits a little so it
+ * leaves as a lump. A real take then waits a few bot ticks on the same target
+ * before it launches. A heal, or a world that is already burning, still goes now.
+ */
+function present(
+  match: MatchState,
+  factionId: number,
+  time: number,
+  skill: Skill,
+  mem: Mind,
+  pool: Upgrade[],
+  order: AiOrder | null,
+): AiOrder | null {
+  if (!botAdditions.enabled) {
+    mem.wind = null;
+    return order;
+  }
+  const fromId = order ? (Object.keys(order.from)[0] ?? "") : "";
+  const amount = fromId && order ? order.from[fromId] : 0;
+  const row = order ? pool.find((u) => u.fromId === fromId && u.toId === order.to) : undefined;
+  const offensive = row?.kind === "take";
+  if (mem.wind && match.planets[mem.wind.fromId]?.owner !== factionId) mem.wind = null;
+
+  const probe = !!(offensive && row && mem.bait && mem.bait.to === order?.to && amount <= row.cost * 0.35);
+  const trouble = !!(fromId && (match.planets[fromId]?.release || 0) > 0);
+  const partial = !!(offensive && row && !row.affordable && amount < row.cost * 0.75 && !probe && !trouble);
+
+  let proposal = order;
+  if (partial) {
+    if (mem.lumpUntil <= 0) mem.lumpUntil = time + 10;
+    if (time < mem.lumpUntil) {
+      mem.floorUntil = 0;
+      proposal = null;
+    }
+  } else if (order) mem.lumpUntil = 0;
+
+  const roi = row?.roi ?? 0;
+  if (proposal && !offensive) {
+    if (!mem.wind || trouble || roi > mem.wind.roi * 1.15) {
+      mem.wind = null;
+      return proposal;
+    }
+  } else if (proposal && offensive && fromId) {
+    const ticks = windTicks(skill);
+    if (ticks <= 0) {
+      mem.wind = null;
+      return proposal;
+    }
+    const wind = mem.wind;
+    const same = !!wind && wind.fromId === fromId && wind.to === proposal.to;
+    if (!same && (!wind || roi > wind.roi * 1.15)) {
+      mem.wind = { fromId, to: proposal.to, amount, roi, left: ticks };
+      return null;
+    }
+    if (same && wind) {
+      wind.amount = amount;
+      wind.roi = Math.max(wind.roi, roi);
+    }
+  }
+
+  if (!mem.wind) return null;
+  mem.wind.left -= 1;
+  if (mem.wind.left > 0) return null;
+  const fired = { from: { [mem.wind.fromId]: mem.wind.amount }, to: mem.wind.to };
+  mem.wind = null;
+  return fired;
+}
+
 type Mind = {
   seed: number;
   last: number;
@@ -556,6 +661,10 @@ type Mind = {
   lostRecently: boolean;
   grew: boolean;
   floorUntil: number;
+  /** Holds a partial send until this time, then lets it go. 0 means not waiting. */
+  lumpUntil: number;
+  /** A take already chosen, waiting out its telegraph. */
+  wind: Wind | null;
 };
 
 const minds = new Map<string, Mind>();
@@ -578,6 +687,8 @@ function blankMind(seed: number, time: number): Mind {
     lostRecently: false,
     grew: false,
     floorUntil: 0,
+    lumpUntil: 0,
+    wind: null,
   };
 }
 
@@ -675,18 +786,26 @@ function activeChapter(factionId: number, match: MatchState, mem: Mind): Chapter
   const phase = phaseOf(match);
   const survival = survivalBook(match, factionId);
   const spot = trailing(match, factionId);
-  if (survival && spot.mine <= 1 && !mem.grew) {
+  if (survival && spot.mine <= 1) {
     if (id === "the_steady_operator") {
-      return { phase, stance: "expand", rule: "no-fresh", note: "Takes one empty world in full before it probes." };
+      return { phase, stance: "expand", rule: "no-fresh", note: "Down to one world, so it takes an empty world in full before it probes again." };
     }
     if (id === "the_stubborn_traditionalist") {
-      return { phase, stance: "cut", rule: "cut-or-empty", note: "Takes an empty world when no hinge is open, then goes back to the cut." };
+      return { phase, stance: "cut", rule: "cut-or-empty", note: "Down to one world, so it takes an empty world when no hinge is open." };
     }
     if (id === "the_lucky_gambler") {
-      return { phase, stance: "expand", rule: "no-fresh", note: "Takes one empty world before it banks." };
+      return { phase, stance: "expand", rule: "no-fresh", note: "Down to one world, so it takes an empty world before it banks." };
     }
     if (id === "the_casual") {
-      return { phase, stance: "expand", rule: "nearest-empty", note: "Takes the nearest empty world before it will fight a neighbor." };
+      return { phase, stance: "expand", rule: "nearest-empty", note: "Down to one world, so it takes the nearest empty world instead of climbing." };
+    }
+    if (id === "the_hyperactive_goblin" || id === "the_burst_prodigy") {
+      return {
+        phase,
+        stance: "expand",
+        rule: "nearest-empty",
+        note: "Down to one world, so it takes the nearest empty world before it goes back to the fight.",
+      };
     }
     if (id === "the_min_maxer" || id === "the_hoarder_pusher") {
       if (id === "the_hoarder_pusher" && !openWorld(match)) {
@@ -816,7 +935,8 @@ function floorTake(pool: Upgrade[], mem: Mind, time: number): AiOrder | "save" |
   }
   if (time < mem.floorUntil) return null;
   const row = nearestRow(takes);
-  const send = Math.max(4, Math.min(row.send, Math.ceil(row.cost * 0.4)));
+  const portion = botAdditions.enabled ? 0.75 : 0.4;
+  const send = Math.max(4, Math.min(row.send, Math.ceil(row.cost * portion)));
   if (send > row.send) return "save";
   mem.floorUntil = time + 16;
   return orderOf(row, send);
@@ -884,13 +1004,22 @@ function addSeen(window: Upgrade[], pool: Upgrade[], pred: (u: Upgrade) => boole
   if (extra && !window.includes(extra)) window.push(extra);
 }
 
+export function massingPlanet(seed: number, planetId: string): boolean {
+  if (!botAdditions.enabled) return false;
+  for (const mem of minds.values()) {
+    if (mem.seed !== seed || !mem.wind || mem.wind.left <= 0) continue;
+    if (mem.wind.fromId === planetId) return true;
+  }
+  return false;
+}
+
 export function thinkAi(match: MatchState, factionId: number, time: number, _rand: () => number = Math.random): AiOrder | null {
   const skill = match.setup.skill;
   const bot = botVars(factionId, skill);
   const mem = recall(match, factionId, time, bot);
   const prey = preyOf(match, factionId);
   const mine = match.defs.filter((d) => match.planets[d.id]?.owner === factionId);
-  if (mine.length === 0) return null;
+  if (mine.length === 0) return present(match, factionId, time, skill, mem, [], null);
 
   const pool: Upgrade[] = [];
   for (const src of mine) {
@@ -967,9 +1096,9 @@ export function thinkAi(match: MatchState, factionId: number, time: number, _ran
     }
   }
 
-  if (pool.length === 0) return null;
+  if (pool.length === 0) return present(match, factionId, time, skill, mem, pool, null);
   let legal = allowed(pool, mem, match, factionId, time, prey);
-  if (legal.length === 0) return null;
+  if (legal.length === 0) return present(match, factionId, time, skill, mem, pool, null);
   if (mem.rule === "nearest-empty" || mem.rule === "no-fresh") {
     const empties = legal.filter((u) => u.kind === "take" && u.victim === NEUTRAL_ID);
     if (empties.length) legal = empties;
@@ -980,33 +1109,36 @@ export function thinkAi(match: MatchState, factionId: number, time: number, _ran
   if (bot.vulture > 0.5) addSeen(window, legal, (u) => u.kind === "take" && u.wounded);
   if (mem.stance === "cut" || bot.reach === "cut") addSeen(window, legal, (u) => u.kind === "take" && u.cut > 0.35);
   weigh(window, bot, mem, prey);
+  nudgeRival(window, match, factionId, time);
 
   const chapterCanTake = legal.some((u) => u.kind === "take" && u.affordable);
   if (!chapterCanTake && !mem.commitTo) {
     const floored = floorTake(pool, mem, time);
-    if (floored === "save") return null;
-    if (floored) return floored;
+    if (floored === "save") return present(match, factionId, time, skill, mem, pool, null);
+    if (floored) return present(match, factionId, time, skill, mem, pool, floored);
   }
 
   const baited = mem.rule === "probe" ? resolveBait(match, time, bot, mem, window, legal) : null;
-  if (baited) return baited;
+  if (baited) return present(match, factionId, time, skill, mem, pool, baited);
 
   if (mem.rule !== "probe" && (mem.mood !== "fortify" || stalled(match, factionId, time))) {
     const dumped = maybePrestige(match, factionId, time, bot, mem, window);
-    if (dumped) return dumped;
+    if (dumped) return present(match, factionId, time, skill, mem, pool, dumped);
   }
 
   const stuck = mem.commitTo ? bestToward(window, mem.commitTo) : null;
-  if (stuck && bot.commit >= 0.35 && (stuck.affordable || bot.commit >= 0.7)) return orderOf(stuck);
+  if (stuck && bot.commit >= 0.35 && (stuck.affordable || bot.commit >= 0.7)) {
+    return present(match, factionId, time, skill, mem, pool, orderOf(stuck));
+  }
 
   const picked = choose(window, bot);
-  if (!picked) return null;
+  if (!picked) return present(match, factionId, time, skill, mem, pool, null);
   const row = window.find((u) => u.toId === picked.to && u.fromId in picked.from);
   if (row?.kind === "take" && bot.commit >= 0.4) {
     mem.commitTo = row.toId;
     mem.commitUntil = time + 12 + 10 * bot.commit;
   }
-  return picked;
+  return present(match, factionId, time, skill, mem, pool, picked);
 }
 
 function resolveBait(

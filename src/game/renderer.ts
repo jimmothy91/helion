@@ -32,6 +32,7 @@ import {
 } from "./catalog";
 import { defaultWorldStats, defsFromWorlds, newSunId, newWorldId, separate, snapFormation, cohortFor, turnFor, clusterCircle, MAX_SUNS, MAX_SUN_SCALE, sunIdFromKey, sunKey, type GroupAnchor, type MapLock, type MapSun, type MapWorld, type RememberGroup, type RememberWorld } from "./maps";
 import { hash3, rgb } from "./noise";
+import { massingPlanet } from "./ai";
 import { drawAtmosphere, drawRings, planetTexture } from "./planets-draw";
 import { craftDraw, match, satelliteOffset, setMotionReduced, sim, takeSparks } from "./sim";
 import type { PlanetDef, Selection, SendTarget } from "./types";
@@ -2555,6 +2556,15 @@ export class WorldView {
       ctx.setLineDash([4, 4]);
       ctx.stroke();
       ctx.setLineDash([]);
+    }
+
+    if (!this.editing && m && massingPlanet(m.seed, id)) {
+      const pulse = 0.5 + 0.5 * Math.sin(this.time * 4);
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, r + 12 + pulse * 5, 0, Math.PI * 2);
+      ctx.strokeStyle = rgb(col, 0.35 + 0.5 * pulse);
+      ctx.lineWidth = 2;
+      ctx.stroke();
     }
 
     if (this.editing && def.id === this.selectedId) {
