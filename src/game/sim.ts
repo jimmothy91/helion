@@ -1,5 +1,6 @@
 import { clearLossCards, nextThink, noteLastWorld, sealLosses, setHeadless, thinkAi } from "./ai";
-import { MAX_LEVEL, SETTLE_S, effectiveForge, keptAfterCapture, lockSeconds, travelKeep, worldClaim, worldHealth, worldRise, generateSystem, OFFLINE_CAP_S, planetSize, planetWorld, satWorld, shellRadii, SPEED_SCALE, STEP, visualSatellites, bindOrbitFrame, setWhirlClock } from "./catalog";
+import { chewCraft } from "./fields";
+import { MAX_LEVEL, SETTLE_S, effectiveForge, keptAfterCapture, lockSeconds, travelKeep, worldClaim, worldHealth, worldRise, generateSystem, OFFLINE_CAP_S, planetSize, planetWorld, satWorld, discLayout, liveReach, SPEED_SCALE, STEP, visualSatellites, bindOrbitFrame, setWhirlClock } from "./catalog";
 import { canLaunch, compileMap, loadMaps, cohortFor, turnFor, type CustomMap } from "./maps";
 import { defaultState, loadSave, writeSave } from "./save";
 import type { Craft, GameState, JuiceEvent, MatchState, PlanetLevel, Selection, SendTarget, SetupConfig } from "./types";
@@ -205,15 +206,68 @@ function checkResult(m: MatchState) {
   const playerAlive = teamAlive(PLAYER_ID, m);
   if (!playerAlive && !ignorePlayerLoss) {
     m.result = "lost";
+    sampleHold(m, true);
+    noteBoard(m, true);
     emit({ kind: "result", result: "lost" });
     persist();
     return;
   }
   if (!rivalAlive && playerAlive) {
     m.result = "won";
+    sampleHold(m, true);
+    noteBoard(m, true);
     emit({ kind: "result", result: "won" });
     persist();
   }
+}
+
+const HOLD_CAP = 160;
+
+/** One colored line per side, same idea as the corner bars, kept across the match. */
+function sampleHold(m: MatchState, force = false) {
+  const list = m.hold ?? (m.hold = []);
+  const t = Math.round(m.elapsed * 10) / 10;
+  const last = list[list.length - 1];
+  const gap = Math.max(2, m.elapsed / (HOLD_CAP - 2));
+  if (!force && last && t - last.t < gap) return;
+  const n = m.factions.map((f) => Math.round(garrisonOf(f.id, m)));
+  const w = m.factions.map((f) => worldsOf(f.id, m));
+  if (last && t - last.t < 0.2) {
+    last.t = t;
+    last.n = n;
+    last.w = w;
+    return;
+  }
+  list.push({ t, n, w });
+  if (list.length <= HOLD_CAP) return;
+  const next = list.filter((_, i) => i % 2 === 0);
+  const tail = list[list.length - 1];
+  if (next[next.length - 1] !== tail) next.push(tail);
+  m.hold = next;
+}
+
+const BOARD_CAP = 120;
+
+/** Board after the open, after each world changes hands, and at the end. */
+function noteBoard(m: MatchState, force = false) {
+  const o = m.defs.map((d) => m.planets[d.id]?.owner ?? NEUTRAL_ID);
+  const list = m.board ?? (m.board = []);
+  const t = Math.round(m.elapsed * 10) / 10;
+  const last = list[list.length - 1];
+  const same = !!last && last.o.length === o.length && last.o.every((v, i) => v === o[i]);
+  if (last && last.t === t) {
+    last.o = o;
+    return;
+  }
+  if (!force && same) return;
+  list.push({ t, o });
+  if (list.length <= BOARD_CAP) return;
+  const head = list[0];
+  const tail = list[list.length - 1];
+  const mid = list.slice(1, -1).filter((_, i) => i % 2 === 0);
+  const next = [head, ...mid];
+  if (next[next.length - 1] !== tail) next.push(tail);
+  m.board = next.length > BOARD_CAP ? [head, ...next.slice(-(BOARD_CAP - 1))] : next;
 }
 
 function produce(m: MatchState, dt: number) {
@@ -239,9 +293,35 @@ function produce(m: MatchState, dt: number) {
   }
 }
 
+function catchGravity(m: MatchState, time: number) {
+  for (const c of m.crafts) {
+    if (c.payload < 1 || !c.hold) continue;
+    let best: { id: string; d: number } | null = null;
+    for (const def of m.defs) {
+      const dest = m.planets[def.id];
+      if (!dest || dest.owner === NEUTRAL_ID || dest.owner !== c.owner) continue;
+      if ((dest.coolLeft ?? 0) > 0) continue;
+      const p = at(def, time);
+      const d = Math.hypot(c.x - p.x, c.y - p.y);
+      if (d > liveReach(def)) continue;
+      if (!best || d < best.d) best = { id: def.id, d };
+    }
+    if (!best) continue;
+    const dest = m.planets[best.id];
+    if (!dest) continue;
+    const amount = Math.floor(c.payload);
+    c.payload = 0;
+    c.hold = false;
+    if (amount < 1) continue;
+    if (sparks.length < 36) sparks.push({ x: c.x, y: c.y, hostile: false });
+    dest.garrison = Math.min(9999, dest.garrison + amount);
+  }
+}
+
 function stepCrafts(m: MatchState, dt: number, time: number) {
   decayNudges(dt);
   integrateCrafts(m, dt, time);
+  catchGravity(m, time);
   if (dt <= 0.06) {
     collideCrafts(m, time);
     collideOrbits(m, time);
@@ -350,8 +430,11 @@ function integrateCrafts(m: MatchState, dt: number, time: number) {
     const dy = destY - c.y;
     const dist = Math.hypot(dx, dy) || 0.0001;
     if (parked && dist < 6) {
+      const prevX = c.x;
+      const prevY = c.y;
       c.x += dx;
       c.y += dy;
+      chewCraft(m, c, prevX, prevY, time);
       c.vx = 0;
       c.vy = 0;
       c.hold = true;
@@ -362,8 +445,11 @@ function integrateCrafts(m: MatchState, dt: number, time: number) {
     const pace = cruiseOf(c.id);
     c.vx += ((dx / dist) * pace - c.vx) * k;
     c.vy += ((dy / dist) * pace - c.vy) * k;
+    const prevX = c.x;
+    const prevY = c.y;
     c.x += c.vx * dt;
     c.y += c.vy * dt;
+    chewCraft(m, c, prevX, prevY, time);
     shedTravel(c, Math.hypot(c.vx, c.vy) * dt);
     if (c.bump > 0) c.bump = Math.max(0, c.bump - dt);
     if (c.cool > 0) c.cool = Math.max(0, c.cool - dt);
@@ -438,7 +524,7 @@ function collideOrbits(m: MatchState, time: number) {
       if (!st || st.garrison < 1) continue;
       const p = planetWorld(def, time, motionReduced);
       const d0 = Math.hypot(c.x - p.x, c.y - p.y);
-      const outer = shellRadii(planetSize(def), def.level ?? 1).at(-1) ?? planetSize(def) + 8;
+      const outer = discLayout(def).radii.at(-1) ?? planetSize(def) + 8;
       if (d0 > outer + 10) continue;
       const n = visualSatellites(st.garrison);
       for (let i = 0; i < n; i++) {
@@ -502,6 +588,7 @@ function pourCapture(m: MatchState, id: string, attacker: number, amount: number
     dest.coolLeft = 0;
     def.level = 1;
     emit({ kind: "capture", id, owner: who, from: prev });
+    noteBoard(m);
     if (m.tutorial >= 3 && m.tutorial < 5 && who === PLAYER_ID) m.tutorial = 4;
     return;
   }
@@ -569,10 +656,12 @@ function prise(m: MatchState, id: string, attacker: number, amount: number) {
     const lock = lockSeconds(def);
     if (lock > 0) {
       dest.coolLeft = lock;
+      noteBoard(m);
       return;
     }
     dest.coolLeft = 0;
     if (surplus > 0) pourCapture(m, id, who, surplus);
+    noteBoard(m);
     return;
   }
   dest.release = paid;
@@ -821,6 +910,7 @@ export function step(dt: number, opts?: { ai?: boolean }) {
   stepCrafts(m, capped, m.elapsed);
   if (opts?.ai !== false) stepAi(m, capped, m.elapsed);
   checkResult(m);
+  if (m.result === "playing") sampleHold(m);
   saveAcc += capped;
   if (saveAcc >= 4) {
     saveAcc = 0;
@@ -846,9 +936,11 @@ export function catchUp() {
     m.elapsed += d;
     bindMatch(m);
     stepCrafts(m, d, m.elapsed);
+    sampleHold(m);
     left -= d;
   }
   checkResult(m);
+  sampleHold(m, m.result !== "playing");
   persist();
   return elapsed;
 }
@@ -898,6 +990,8 @@ export function startMatch(setup: SetupConfig, seed = (Date.now() ^ (Math.random
     paused: false,
     aiWait,
   };
+  sampleHold(sim.state.match!);
+  noteBoard(sim.state.match!);
   persist();
 }
 
@@ -933,11 +1027,20 @@ export function startCustomMatch(map: CustomMap) {
       skill: map.skill,
       worlds: map.worlds.map((w) => ({ ...w })),
       ...(map.suns?.length ? { suns: map.suns.map((s) => ({ ...s })) } : {}),
+      ...(map.rocks?.length ? { rocks: map.rocks.slice() } : {}),
       ...(map.locks?.length
-        ? { locks: map.locks.map((lock) => ({ ...lock, worldIds: lock.worldIds.slice(), sunIds: lock.sunIds.slice() })) }
+        ? {
+            locks: map.locks.map((lock) => ({
+              ...lock,
+              worldIds: lock.worldIds.slice(),
+              sunIds: lock.sunIds.slice(),
+            })),
+          }
         : {}),
     },
   };
+  sampleHold(sim.state.match!);
+  noteBoard(sim.state.match!);
   persist();
   return true;
 }

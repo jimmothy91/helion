@@ -467,19 +467,39 @@ export function planetSize(def: { level?: number }): number {
   return planetLevelSize(def.level ?? 1);
 }
 
-/** A few degrees off edge-on, so the disc reads as a shallow ellipse. */
-export const DISC_OPEN = Math.sin((18 * Math.PI) / 180);
+/** Pitched closer to edge-on than before, so the disc reads more tilted. */
+export const DISC_OPEN = Math.sin((12 * Math.PI) / 180);
+/** Cant of that disc, so the long axis is not level with the screen. */
+export const DISC_ROLL = (10 * Math.PI) / 180;
+/** Center-to-center gap of the rings. The band is a little narrower, so a groove remains. */
+const SAT_SPAN = 7;
 
-/** One thin ring. Each level stretches the radius; it does not add another circle. */
-export function discRadius(size: number, level: number): number {
+/** One ring per level, all in the same plane. Level 1 is the inner ring. */
+export function shellRadii(size: number, level: number): number[] {
   const lv = clampLevel(level);
-  const close = size + 12;
-  return close * (1 + (lv - 1) * 0.22);
+  const first = size + SAT_SPAN;
+  const rings: number[] = [];
+  for (let i = 0; i < lv; i++) rings.push(first + i * SAT_SPAN);
+  return rings;
 }
 
-/** Outer reach of the satellite disc. One entry, kept for callers that want the rim. */
-export function shellRadii(size: number, level: number): number[] {
-  return [discRadius(size, level)];
+/** Outer reach of the satellite disc. */
+export function discRadius(size: number, level: number): number {
+  const rings = shellRadii(size, level);
+  return rings[rings.length - 1];
+}
+
+/** Rings locked to the fully grown world, so a level fills an outline instead of moving it. */
+export function discLayout(def: { level?: number; maxLevel?: number }): { current: number; max: number; radii: number[] } {
+  const current = clampLevel(def.level ?? 1);
+  const max = clampLevel(Math.max(current, def.maxLevel ?? current));
+  return { current, max, radii: shellRadii(planetLevelSize(max), max) };
+}
+
+/** Radius of the widest ring this world has already reached. Ghost rings do not count. */
+export function liveReach(def: { level?: number; maxLevel?: number }): number {
+  const layout = discLayout(def);
+  return layout.radii[Math.max(0, layout.current - 1)] ?? planetLevelSize(layout.current);
 }
 
 /** Satellites to break or rise a world. Level 1 is 200, then 400, 600, 800, and 1000. */
@@ -573,23 +593,42 @@ export function visualSatellites(garrison: number): number {
   return Math.min(48, 28 + Math.floor(Math.log2(1 + g - 28) * 6));
 }
 
+/** A point on the tilted disc, in world space. `ang` 0 is the long-axis tip. */
+export function discPoint(cx: number, cy: number, radius: number, ang: number): { x: number; y: number } {
+  const lx = Math.cos(ang) * radius;
+  const ly = Math.sin(ang) * radius * DISC_OPEN;
+  const c = Math.cos(DISC_ROLL);
+  const s = Math.sin(DISC_ROLL);
+  return { x: cx + lx * c - ly * s, y: cy + lx * s + ly * c };
+}
+
 export function satWorld(
   def: PlanetDef,
   i: number,
   time: number,
   reduced: boolean,
-): { x: number; y: number; near: number } {
-  const wobble = (hash3(i + 3, def.seed, 8.2) - 0.5) * 2.2;
-  const rad = discRadius(planetSize(def), def.level ?? 1) + wobble;
-  const phase = hash3(1, def.seed, 3.1) * Math.PI * 2;
+): { x: number; y: number; near: number; rot: number } {
+  const layout = discLayout(def);
+  const ring = i % layout.current;
+  const radii = layout.radii;
+  const wobble = (hash3(i + 3, def.seed, 8.2) - 0.5) * 1.2;
+  const rad = radii[ring] + wobble;
+  const phase = hash3(1, def.seed, 3.1) * Math.PI * 2 + ring * 0.85;
   const spin = reduced ? 0 : 1;
-  const ang = phase + time * 0.4 * spin + i * 2.399963;
+  const onRing = Math.floor(i / layout.current);
+  const ang = phase + time * (0.32 + ring * 0.03) * spin + onRing * 2.399963;
   const p = planetWorld(def, time, reduced);
-  const near = Math.sin(ang);
+  const lx = Math.cos(ang) * rad;
+  const ly = Math.sin(ang) * rad * DISC_OPEN;
+  const c = Math.cos(DISC_ROLL);
+  const s = Math.sin(DISC_ROLL);
+  const tx = -Math.sin(ang) * c - Math.cos(ang) * DISC_OPEN * s;
+  const ty = -Math.sin(ang) * s + Math.cos(ang) * DISC_OPEN * c;
   return {
-    x: p.x + Math.cos(ang) * rad,
-    y: p.y + near * rad * DISC_OPEN,
-    near,
+    x: p.x + lx * c - ly * s,
+    y: p.y + lx * s + ly * c,
+    near: Math.sin(ang),
+    rot: Math.atan2(ty, tx),
   };
 }
 

@@ -151,6 +151,8 @@ export type Craft = {
   oy?: number;
   /** Sitting on the open-sky order. */
   hold?: boolean;
+  /** Asteroid cells this craft has already paid. */
+  dug?: string;
 };
 
 export type GameSpeed = "slow" | "medium" | "fast";
@@ -187,6 +189,14 @@ export type MatchState = {
   mapId?: string;
   /** Full editor copy of that map, so a reload can put it back in the library. */
   sourceMap?: import("./maps").CustomMap;
+  /** Density left in asteroid cells. Missing keys are still full. */
+  fieldWear?: Record<string, number>;
+  /** What each faction has spent crossing fields this match. */
+  fieldNotes?: Record<number, { band: "open" | "thin" | "thick"; entered: number; lost: number }>;
+  /** Satellites (`n`) and planets (`w`) each faction held, in faction order. */
+  hold?: { t: number; n: number[]; w?: number[] }[];
+  /** Who held each world, in map order, at the open, at each capture, and at the end. */
+  board?: { t: number; o: number[] }[];
 };
 
 export type GameState = {

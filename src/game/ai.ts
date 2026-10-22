@@ -1,4 +1,5 @@
 import { ELLIPSE, MAX_LEVEL, planetSize, planetWorld, travelKeep, worldClaim, worldForge, worldHealth, worldRise } from "./catalog";
+import { enemyInFields, surveyFlight, type FieldBand } from "./fields";
 import type { MatchState, Skill } from "./types";
 import { NEUTRAL_ID, PLAYER_ID } from "./types";
 
@@ -249,7 +250,7 @@ export function botLine(factionId: number): string {
 }
 
 /** Card stamp. First number: player rules. Second: bots. Third: a fix that should not change a match. */
-export const REPORT_BUILD = "1.1.0";
+export const REPORT_BUILD = "2.2.0";
 
 export type LossCard = {
   factionId: number;
@@ -465,9 +466,16 @@ export function sealLosses(match: MatchState) {
       "Wiped out: no worlds and no satellites left.",
       `Grudge: ${blow.grudge}`,
       `Was finishing: ${blow.commit}`,
+      ...fieldLine(match, f.id),
     ].join("\n");
     lossList.push({ factionId: f.id, name: f.name, text, build: REPORT_BUILD, map });
   }
+}
+
+function fieldLine(match: MatchState, id: number): string[] {
+  const note = match.fieldNotes?.[id];
+  if (!note || note.entered < 1) return [];
+  return [`Field: ${note.band}. ${note.entered} entered, ${note.lost} lost.`];
 }
 
 export function nextThink(factionId: number, skill: Skill): number {
@@ -536,6 +544,7 @@ type Upgrade = {
   near: number;
   cut: number;
   hop: number;
+  field?: FieldBand;
 };
 
 type Mood = "expand" | "fortify" | "hunt";
@@ -664,6 +673,8 @@ type Mind = {
   floorUntil: number;
   /** Holds a partial send until this time, then lets it go. 0 means not waiting. */
   lumpUntil: number;
+  /** A waiter holds one decision while someone else is inside a thick field. */
+  fieldHold: number;
   /** A take already chosen, waiting out its telegraph. */
   wind: Wind | null;
 };
@@ -689,6 +700,7 @@ function blankMind(seed: number, time: number): Mind {
     grew: false,
     floorUntil: 0,
     lumpUntil: 0,
+    fieldHold: 0,
     wind: null,
   };
 }
@@ -914,9 +926,20 @@ function nearestRow(rows: Upgrade[]): Upgrade {
   return rows.reduce((a, b) => (a.near <= b.near ? a : b));
 }
 
+function thickDrip(u: Upgrade) {
+  return u.field === "thick" && !(u.affordable || u.send >= Math.max(12, u.cost * 0.55));
+}
+
 /** Floor under every chapter. Revert by deleting this and the call in thinkAi. */
 function floorTake(pool: Upgrade[], mem: Mind, time: number): AiOrder | "save" | null {
-  const takes = pool.filter((u) => u.kind === "take" && u.send >= 4);
+  const raw = pool.filter((u) => u.kind === "take" && u.send >= 4);
+  const empties = raw.filter((u) => u.victim === NEUTRAL_ID);
+  const passableEmpties = empties.filter((u) => !thickDrip(u));
+  const banks =
+    mem.rule === "nearest-empty" || mem.rule === "no-fresh" || mem.rule === "neighbors" || mem.rule === "cut-or-empty";
+  if (banks && empties.length > 0 && passableEmpties.length === 0) return "save";
+  const takes = raw.filter((u) => !thickDrip(u));
+  if (!takes.length) return pool.some((u) => u.kind === "take" && thickDrip(u)) ? "save" : null;
   if (!takes.length) return null;
   const empty = takes.filter((u) => u.victim === NEUTRAL_ID);
   const bleeding = takes.filter((u) => u.wounded);
@@ -970,6 +993,55 @@ function weigh(window: Upgrade[], bot: BotVars, mem: Mind, prey: number) {
     else if (mem.mood === "fortify") u.roi *= 1 - 0.72 * mood;
     else if (u.victim === prey) u.roi *= 1 + 0.9 * mood;
   }
+}
+
+function fieldStyle(id: ArchetypeId, stance: Stance): "punch" | "wait" | "probe" {
+  if (id === "the_steady_operator") return "probe";
+  if (id === "the_casual" || id === "the_hoarder_pusher" || id === "the_stubborn_traditionalist") return "wait";
+  if (id === "the_lucky_gambler" && stance === "fortify") return "wait";
+  return "punch";
+}
+
+/** Open lanes are cheap for everyone. Thick rock is a lump, a wait, or a probe. */
+function weighRocks(window: Upgrade[], match: MatchState, factionId: number, time: number, mem: Mind): boolean {
+  if (!match.sourceMap?.rocks?.length) return false;
+  const style = fieldStyle(archetypeId(factionId), mem.stance);
+  const clearEmpty = window.some((u) => u.kind === "take" && u.victim === NEUTRAL_ID && u.field !== "thick");
+  let hold = false;
+  let enemyThick = false;
+  for (const u of window) {
+    if (u.kind !== "take" || !u.field) continue;
+    if (u.field === "open") {
+      u.roi *= 1.35;
+      continue;
+    }
+    if (u.field === "thin") {
+      if (style === "wait") u.roi *= 0.82;
+      continue;
+    }
+    const from = match.defs.find((d) => d.id === u.fromId);
+    const to = match.defs.find((d) => d.id === u.toId);
+    const survey =
+      from && to
+        ? surveyFlight(match, planetWorld(from, time, false).x, planetWorld(from, time, false).y, planetWorld(to, time, false).x, planetWorld(to, time, false).y, time)
+        : null;
+    const enemy = survey ? enemyInFields(match, factionId, survey.fieldIds, time) : false;
+    const lump = u.affordable || u.send >= Math.max(12, u.cost * 0.55);
+    if (style === "wait") {
+      if (enemy) {
+        enemyThick = true;
+        if (mem.fieldHold === 0 || time < mem.fieldHold) hold = true;
+      } else {
+        u.roi *= clearEmpty ? 0.08 : 0.4;
+      }
+      continue;
+    } else if (style === "probe") {
+      u.roi *= enemy ? 1.2 : 0.75;
+    } else if (!lump) u.roi *= 0.25;
+    else u.roi *= 0.9;
+  }
+  if (!enemyThick && mem.fieldHold !== 0 && time >= mem.fieldHold) mem.fieldHold = 0;
+  return hold;
 }
 
 function borderOf(rows: Upgrade[]): number {
@@ -1081,8 +1153,10 @@ export function thinkAi(match: MatchState, factionId: number, time: number, _ran
         continue;
       }
       const price = capturePrice(match, dst.id, factionId);
-      const need = Math.max(4, Math.ceil(price / keep));
-      let boost = worldForge(dst, dt.level || 1) * keep;
+      const rocks = surveyFlight(match, fromPos.x, fromPos.y, toPos.x, toPos.y, time);
+      const fieldKeep = rocks?.keep ?? 1;
+      const need = Math.max(4, Math.ceil(price / (keep * fieldKeep)));
+      let boost = worldForge(dst, dt.level || 1) * keep * fieldKeep;
       if (dt.owner === NEUTRAL_ID) boost *= 1.15;
       else if (dt.owner === PLAYER_ID) boost *= skill === "relentless" ? 1.45 : skill === "cautious" ? 0.75 : 1.1;
       else boost *= 0.9;
@@ -1093,6 +1167,7 @@ export function thinkAi(match: MatchState, factionId: number, time: number, _ran
         near,
         cut: cutScore(match, dst.id, dt.owner, time),
         hop,
+        ...(rocks ? { field: rocks.band } : {}),
       });
     }
   }
@@ -1109,18 +1184,23 @@ export function thinkAi(match: MatchState, factionId: number, time: number, _ran
   if (mem.grudge > 0) addSeen(window, legal, (u) => u.kind === "take" && u.victim === mem.grudge);
   if (bot.vulture > 0.5) addSeen(window, legal, (u) => u.kind === "take" && u.wounded);
   if (mem.stance === "cut" || bot.reach === "cut") addSeen(window, legal, (u) => u.kind === "take" && u.cut > 0.35);
+  if (mem.rule === "probe") addSeen(window, legal, (u) => u.kind === "take" && u.field === "thick" && u.victim > 0);
   weigh(window, bot, mem, prey);
   nudgeRival(window, match, factionId, time);
+  if (weighRocks(legal, match, factionId, time, mem)) {
+    if (mem.fieldHold === 0 || time >= mem.fieldHold) mem.fieldHold = time + 3;
+    return present(match, factionId, time, skill, mem, pool, null);
+  }
 
   const chapterCanTake = legal.some((u) => u.kind === "take" && u.affordable);
-  if (!chapterCanTake && !mem.commitTo) {
+  const baited = mem.rule === "probe" ? resolveBait(match, time, bot, mem, window, legal) : null;
+  if (baited) return present(match, factionId, time, skill, mem, pool, baited);
+  const probing = !!(mem.rule === "probe" && mem.bait && time < mem.bait.until);
+  if (!probing && !chapterCanTake && !mem.commitTo) {
     const floored = floorTake(pool, mem, time);
     if (floored === "save") return present(match, factionId, time, skill, mem, pool, null);
     if (floored) return present(match, factionId, time, skill, mem, pool, floored);
   }
-
-  const baited = mem.rule === "probe" ? resolveBait(match, time, bot, mem, window, legal) : null;
-  if (baited) return present(match, factionId, time, skill, mem, pool, baited);
 
   if (mem.rule !== "probe" && (mem.mood !== "fortify" || stalled(match, factionId, time))) {
     const dumped = maybePrestige(match, factionId, time, bot, mem, window);
@@ -1170,7 +1250,8 @@ function resolveBait(
     .filter((u) => u.kind === "take" && u.victim > 0 && u.send >= 4)
     .sort((a, b) => b.roi - a.roi)[0];
   if (!prize) return null;
-  const probe = Math.max(4, Math.min(prize.send, Math.ceil(prize.cost * 0.28)));
+  const probe =
+    prize.field === "thick" ? Math.max(8, Math.min(16, prize.send)) : Math.max(4, Math.min(prize.send, Math.ceil(prize.cost * 0.28)));
   if (probe > prize.send) return null;
   mem.bait = {
     to: prize.toId,

@@ -154,7 +154,7 @@ export function HelionApp() {
       sendSelected(sel, to, crafts, Boolean(repeat));
       setSelected(0);
     };
-    view.onEdit = (worlds, selectedId, suns, locks) => {
+    view.onEdit = (worlds, selectedId, suns, locks, rocks) => {
       const id = activeRef.current;
       if (!id) return;
       let hit = false;
@@ -167,6 +167,8 @@ export function HelionApp() {
             ...item,
             worlds,
             ...(suns.length ? { suns } : { suns: undefined }),
+            ...(rocks.length ? { rocks } : { rocks: undefined }),
+            fields: undefined,
             ...(locks.length ? { locks } : { locks: undefined }),
           };
         }),
@@ -289,7 +291,7 @@ export function HelionApp() {
     const view = viewRef.current;
     if (!view || screen !== "atlas" || !activeMap) return;
     view.editing = true;
-    view.setDraft(activeMap.worlds, mapSelected, placing, activeMap.suns ?? null, activeMap.locks ?? null);
+    view.setDraft(activeMap.worlds, mapSelected, placing, activeMap.suns ?? null, activeMap.locks ?? null, activeMap.rocks ?? null);
   }, [screen, activeMap, mapSelected, placing]);
 
   useEffect(() => {
@@ -367,7 +369,7 @@ export function HelionApp() {
       if (view) {
         view.editing = true;
         view.setPlacing(true);
-        view.setDraft(current.worlds, null, true, current.suns ?? null, current.locks ?? null);
+        view.setDraft(current.worlds, null, true, current.suns ?? null, current.locks ?? null, current.rocks ?? null);
         view.fit();
       }
       setScreen("atlas");
@@ -510,6 +512,7 @@ export function HelionApp() {
             viewRef.current?.setPlacing(next);
           }}
           onSunPlace={(on) => viewRef.current?.setSunPlace(on)}
+          onRockBrush={(brush) => viewRef.current?.setRockBrush(brush)}
           onOrbitPlace={(on) => viewRef.current?.setPlaceOrbit(on)}
           onPlaceOwner={(owner) => viewRef.current?.setPlaceOwner(owner)}
           onPlaceKind={(index) => viewRef.current?.setPlaceTemplate(index)}

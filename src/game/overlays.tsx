@@ -13,7 +13,7 @@ import {
   factionCss,
   legalSetup,
 } from "./catalog";
-import { fmt, fmtRate } from "./format";
+import { fmt, fmtRate, fmtTime } from "./format";
 import { canLaunch, type CustomMap, type MapCategory } from "./maps";
 import { importSave } from "./save";
 import {
@@ -25,8 +25,8 @@ import {
   setTutorial,
   sim,
 } from "./sim";
-import type { GameSpeed, Panel, SetupConfig, Skill } from "./types";
-import { PLAYER_ID } from "./types";
+import type { GameSpeed, MatchState, Panel, SetupConfig, Skill } from "./types";
+import { NEUTRAL_ID, PLAYER_ID } from "./types";
 
 function Sheet({
   open,
@@ -549,7 +549,9 @@ export function HelpSheet({ open, onClose }: { open: boolean; onClose: () => voi
           <span className="font-medium text-fg">4. Rise.</span> Forging does not level a world. Once it is healthy, a pale
           corona fills from empty to full as you pay 200 times its level — 200, 400, 600, and 800, then 1000 to hold
           level 5 — by tapping it again or sending satellites from your other worlds. An attack spends that corona first. It clears
-          when the world rises. Yours pass through yours. Another side's destroy each other. The match ends when
+          when the world rises. Yours pass through yours. Another side's destroy each other. A patch of rocks leaks:
+          some satellites get through, and a stack that keeps hitting the same spot clears a lane for the rest of the
+          match. Satellites in orbit ignore the rocks. The match ends when
           only one team is left.
         </li>
       </ol>
@@ -717,6 +719,102 @@ export function PauseSheet({
   );
 }
 
+function ReportChart({ m }: { m: MatchState }) {
+  const samples = (m.hold ?? []).filter((s) => s && Number.isFinite(s.t) && Array.isArray(s.n));
+  const boards = (m.board ?? []).filter((s) => s && Number.isFinite(s.t) && Array.isArray(s.o) && s.o.length > 0);
+  if (samples.length < 1 && boards.length < 1) return null;
+  const w = 300;
+  const h = 132;
+  const padX = 8;
+  const padY = 8;
+  const planets = Math.max(1, m.defs.length, ...boards.map((b) => b.o.length));
+  const maxT = Math.max(m.elapsed, samples[samples.length - 1]?.t ?? 0, boards[boards.length - 1]?.t ?? 0, 1);
+  let peak = 1;
+  for (const s of samples) for (const v of s.n) if (v > peak) peak = v;
+  const inner = w - padX * 2;
+  const bw = Math.max(3.5, Math.min(12, (inner / Math.max(boards.length, 1)) * 0.62));
+  const xOf = (t: number) => padX + bw / 2 + (t / maxT) * (inner - bw);
+  const yOf = (v: number) => h - padY - (Math.max(0, v) / peak) * (h - padY * 2);
+  const drawn: { x: number; o: number[] }[] = [];
+  for (const b of boards) {
+    const x = xOf(b.t);
+    const prev = drawn[drawn.length - 1];
+    if (prev && x - prev.x < bw + 1.25) drawn[drawn.length - 1] = { x, o: b.o };
+    else drawn.push({ x, o: b.o });
+  }
+  const slice = (h - padY * 2) / planets;
+  const gap = slice > 3.2 ? 0.7 : 0;
+  const empty = boards.some((b) => b.o.some((id) => id === NEUTRAL_ID));
+  const sides = [...m.factions].sort((a, b) => (a.id === PLAYER_ID ? 1 : 0) - (b.id === PLAYER_ID ? 1 : 0));
+  return (
+    <div className="mt-4">
+      <div className="mb-1 flex items-baseline justify-between">
+        <p className="text-[11px] font-medium uppercase tracking-[0.14em] text-subtle">Satellites held</p>
+        <p className="text-[10px] tabular-nums text-muted">{fmt(peak)}</p>
+      </div>
+      <svg viewBox={`0 0 ${w} ${h}`} className="h-36 w-full" role="img" aria-label="Satellites held over time, and who held each planet at each capture">
+        <line x1={padX} y1={yOf(0)} x2={w - padX} y2={yOf(0)} stroke="rgba(197,205,216,0.22)" strokeWidth="1" />
+        {drawn.map((bar, bi) =>
+          Array.from({ length: planets }, (_, i) => {
+            const owner = bar.o[i] ?? NEUTRAL_ID;
+            const sh = Math.max(0.8, slice - gap);
+            const y = h - padY - (i + 1) * slice + (slice - sh) / 2;
+            return (
+              <rect
+                key={`${bi}-${i}`}
+                x={bar.x - bw / 2}
+                y={y}
+                width={bw}
+                height={sh}
+                rx={0.6}
+                fill={factionCss(factionColor(owner))}
+                fillOpacity={owner === NEUTRAL_ID ? 0.28 : 0.72}
+              />
+            );
+          }),
+        )}
+        {sides.map((f) => {
+          const fi = m.factions.findIndex((side) => side.id === f.id);
+          const pts = samples.map((s) => ({ x: xOf(s.t), y: yOf(s.n[fi] ?? 0) }));
+          if (pts.length < 1) return null;
+          const d = pts.map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+          const you = f.id === PLAYER_ID;
+          return (
+            <g key={f.id}>
+              <path
+                d={d}
+                fill="none"
+                stroke={factionCss(factionColor(f.id))}
+                strokeWidth={you ? 2.4 : 1.6}
+                strokeLinejoin="round"
+                strokeLinecap="round"
+              />
+              {pts.length === 1 && (
+                <circle cx={pts[0].x} cy={pts[0].y} r={you ? 2.4 : 1.8} fill={factionCss(factionColor(f.id))} />
+              )}
+            </g>
+          );
+        })}
+      </svg>
+      <p className="mt-1 text-[10px] leading-snug text-muted">Each bar is the board at a capture. Every slice is one planet.</p>
+      <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1">
+        {m.factions.map((f) => (
+          <span key={f.id} className="inline-flex items-center gap-1 text-[11px] text-muted">
+            <span className="size-1.5 rounded-full" style={{ background: factionCss(factionColor(f.id)) }} />
+            {f.name}
+          </span>
+        ))}
+        {empty && (
+          <span className="inline-flex items-center gap-1 text-[11px] text-muted">
+            <span className="size-1.5 rounded-full" style={{ background: factionCss(factionColor(NEUTRAL_ID)) }} />
+            Empty
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function ResultOverlay({
   visible,
   onAgain,
@@ -730,12 +828,17 @@ export function ResultOverlay({
   if (!visible || !m || m.result === "playing") return null;
   const won = m.result === "won";
   return (
-    <div className="absolute inset-0 z-30 flex flex-col justify-end bg-gradient-to-b from-transparent via-bg/55 to-bg px-6 pb-[max(2rem,env(safe-area-inset-bottom))]">
-      <div className="mx-auto w-full max-w-lg">
+    <div className="absolute inset-0 z-30 overflow-y-auto bg-gradient-to-b from-transparent via-bg/55 to-bg">
+      <div className="mx-auto flex min-h-full w-full max-w-lg flex-col justify-end px-6 pt-24 pb-[max(2rem,env(safe-area-inset-bottom))]">
         <p className="text-xs font-medium uppercase tracking-[0.22em] text-muted">{won ? "Rivals eliminated" : "Last world fell"}</p>
         <h2 className="mt-2 font-display text-4xl font-semibold tracking-[-0.04em] text-fg">
           {won ? "You are the last team" : "The swarm went dark"}
         </h2>
+        <p className="mt-3 text-sm text-fg">
+          {won ? "Won in " : "Lasted "}
+          <span className="font-medium tabular-nums">{fmtTime(m.elapsed)}</span>
+        </p>
+        <ReportChart m={m} />
         <p className="mt-3 text-sm leading-relaxed text-muted">
           {won
             ? "Every other team is gone. Empty worlds can stay dark. Shape another system, or rest here."

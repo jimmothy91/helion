@@ -12,6 +12,7 @@ import {
 } from "./catalog";
 import { MAX_CATEGORIES, MAX_MAPS, MAX_SUNS, sunIdFromKey, canLaunch, type CustomMap, type MapCategory, type MapLock, type MapWorld, type RememberGroup, type RememberWorld } from "./maps";
 import { botLine } from "./ai";
+import type { RockBrush } from "./fields";
 import type { Skill } from "./types";
 import { NEUTRAL_ID, PLAYER_ID } from "./types";
 
@@ -126,6 +127,96 @@ function Stat({
   );
 }
 
+function RailStat({
+  label,
+  value,
+  min,
+  max,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  onChange: (next: number) => void;
+}) {
+  const clamp = (n: number) => Math.max(min, Math.min(max, Math.round(n)));
+  const [text, setText] = useState(String(value));
+  const focused = useRef(false);
+  useEffect(() => {
+    if (!focused.current) setText(String(value));
+  }, [value]);
+  function set(next: number) {
+    const n = Number.isFinite(next) ? clamp(next) : value;
+    onChange(n);
+    setText(String(n));
+  }
+  function hold(dir: number) {
+    let current = value;
+    const tick = () => {
+      current = clamp(current + dir);
+      onChange(current);
+      setText(String(current));
+    };
+    tick();
+    const id = window.setInterval(tick, 70);
+    const stop = () => {
+      window.clearInterval(id);
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+    };
+    window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+  }
+  return (
+    <div>
+      <span className="block text-center text-[9px] leading-none text-muted">{label}</span>
+      <div className="mt-0.5 flex h-7 gap-0.5">
+        <button
+          type="button"
+          aria-label={`Less ${label}`}
+          className="w-6 shrink-0 rounded-md bg-surface-2 text-sm text-fg"
+          onPointerDown={(e) => {
+            e.preventDefault();
+            hold(-1);
+          }}
+        >
+          −
+        </button>
+        <input
+          aria-label={label}
+          inputMode="numeric"
+          value={text}
+          onFocus={() => {
+            focused.current = true;
+          }}
+          onBlur={() => {
+            focused.current = false;
+            set(Number(text));
+          }}
+          onChange={(e) => {
+            setText(e.target.value);
+            const n = Number(e.target.value);
+            if (e.target.value.trim() !== "" && Number.isFinite(n)) onChange(clamp(n));
+          }}
+          className="min-w-0 flex-1 rounded-md border border-border bg-surface/95 text-center text-[11px] tabular-nums text-fg outline-none"
+        />
+        <button
+          type="button"
+          aria-label={`More ${label}`}
+          className="w-6 shrink-0 rounded-md bg-surface-2 text-sm text-fg"
+          onPointerDown={(e) => {
+            e.preventDefault();
+            hold(1);
+          }}
+        >
+          +
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function MapEditor({
   categories,
   categoryId,
@@ -135,6 +226,7 @@ export function MapEditor({
   placing,
   onPlacing,
   onSunPlace,
+  onRockBrush,
   onOrbitPlace,
   onPlaceOwner,
   onPlaceKind,
@@ -173,6 +265,7 @@ export function MapEditor({
   placing: boolean;
   onPlacing: (next: boolean) => void;
   onSunPlace: (on: boolean) => void;
+  onRockBrush: (brush: RockBrush | null) => void;
   onOrbitPlace: (on: boolean) => void;
   onPlaceOwner: (owner: number | null) => void;
   onPlaceKind: (index: number) => void;
@@ -207,6 +300,13 @@ export function MapEditor({
   const [armedCategory, setArmedCategory] = useState(false);
   const [snap, setSnap] = useState(false);
   const [placeSun, setPlaceSun] = useState(false);
+  const [placeField, setPlaceField] = useState(false);
+  const [rockShape, setRockShape] = useState<"bar" | "ring">("bar");
+  const [rockErase, setRockErase] = useState(false);
+  const [rockThick, setRockThick] = useState(2);
+  const [rockPack, setRockPack] = useState(3);
+  const [barSpan, setBarSpan] = useState(8);
+  const [ringSpan, setRingSpan] = useState(8);
   const [selecting, setSelecting] = useState(false);
   const [placeOrbit, setPlaceOrbit] = useState(false);
   const [placeOwner, setPlaceOwner] = useState<number | null>(null);
@@ -235,6 +335,8 @@ export function MapEditor({
     onSelectTool(true);
     setPlaceSun(false);
     onSunPlace(false);
+    setPlaceField(false);
+    onRockBrush(null);
     onPlacing(false);
     // Placement turns the select tool on so the new group can be moved.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -245,6 +347,21 @@ export function MapEditor({
     // The canvas snap flag follows this control, including when the editor unmounts.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [snap]);
+  useEffect(() => {
+    if (!placeField) {
+      onRockBrush(null);
+      return;
+    }
+    onRockBrush({
+      shape: rockShape,
+      erase: rockErase,
+      thick: rockThick,
+      span: rockShape === "ring" ? ringSpan : barSpan,
+      pack: rockPack,
+    });
+    // The brush follows these controls while Rocks is on.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [placeField, rockShape, rockErase, rockThick, rockPack, barSpan, ringSpan]);
   useEffect(() => {
     if (!selectedId || hidden) return;
     const scroller = scrollerRef.current;
@@ -546,6 +663,8 @@ export function MapEditor({
             if (next) {
               setPlaceSun(false);
               onSunPlace(false);
+              setPlaceField(false);
+              onRockBrush(null);
               setSelecting(false);
               onSelectTool(false);
             } else setKindOpen(false);
@@ -597,6 +716,8 @@ export function MapEditor({
             if (next) {
               setPlaceSun(false);
               onSunPlace(false);
+              setPlaceField(false);
+              onRockBrush(null);
               onPlacing(false);
             }
           }}
@@ -612,6 +733,8 @@ export function MapEditor({
             onSunPlace(next);
             if (next) {
               onPlacing(false);
+              setPlaceField(false);
+              onRockBrush(null);
               setSelecting(false);
               onSelectTool(false);
             }
@@ -619,6 +742,87 @@ export function MapEditor({
         >
           Sun
         </RailButton>
+        <RailButton
+          on={placeField}
+          label="Paint asteroid terrain"
+          onClick={() => {
+            const next = !placeField;
+            setPlaceField(next);
+            if (next) {
+              onPlacing(false);
+              setPlaceSun(false);
+              onSunPlace(false);
+              setSelecting(false);
+              onSelectTool(false);
+            } else onRockBrush(null);
+          }}
+        >
+          Rocks
+        </RailButton>
+        {placeField && (
+          <>
+            <div className="flex gap-0.5">
+              <button
+                type="button"
+                aria-label="Bar"
+                aria-pressed={rockShape === "bar"}
+                onClick={() => setRockShape("bar")}
+                className={cn(
+                  "h-8 min-w-0 flex-1 rounded-md border text-[10px] font-medium",
+                  rockShape === "bar" ? "border-accent bg-accent text-accent-fg" : "border-border bg-surface/95 text-muted",
+                )}
+              >
+                Bar
+              </button>
+              <button
+                type="button"
+                aria-label="Ring"
+                aria-pressed={rockShape === "ring"}
+                onClick={() => setRockShape("ring")}
+                className={cn(
+                  "h-8 min-w-0 flex-1 rounded-md border text-[10px] font-medium",
+                  rockShape === "ring" ? "border-accent bg-accent text-accent-fg" : "border-border bg-surface/95 text-muted",
+                )}
+              >
+                Ring
+              </button>
+            </div>
+            <div className="flex gap-0.5">
+              <button
+                type="button"
+                aria-label="Paint rocks"
+                aria-pressed={!rockErase}
+                onClick={() => setRockErase(false)}
+                className={cn(
+                  "h-8 min-w-0 flex-1 rounded-md border text-[10px] font-medium",
+                  !rockErase ? "border-accent bg-accent text-accent-fg" : "border-border bg-surface/95 text-muted",
+                )}
+              >
+                Paint
+              </button>
+              <button
+                type="button"
+                aria-label="Erase rocks"
+                aria-pressed={rockErase}
+                onClick={() => setRockErase(true)}
+                className={cn(
+                  "h-8 min-w-0 flex-1 rounded-md border text-[10px] font-medium",
+                  rockErase ? "border-accent bg-accent text-accent-fg" : "border-border bg-surface/95 text-muted",
+                )}
+              >
+                Erase
+              </button>
+            </div>
+            <RailStat label="Thick" value={rockThick} min={1} max={8} onChange={setRockThick} />
+            <RailStat label="Dense" value={rockPack} min={1} max={5} onChange={setRockPack} />
+            {rockShape === "ring" ? (
+              <RailStat label="Radius" value={ringSpan} min={2} max={48} onChange={setRingSpan} />
+            ) : (
+              <RailStat label="Length" value={barSpan} min={1} max={64} onChange={setBarSpan} />
+            )}
+            <p className="px-0.5 text-center text-[9px] leading-tight text-muted">Drag to lay it. Snap joins lines and rings.</p>
+          </>
+        )}
         <RailButton on={orbitOn} label="Orbit" onClick={toggleOrbit}>
           Orbit
         </RailButton>

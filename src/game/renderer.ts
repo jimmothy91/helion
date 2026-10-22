@@ -22,28 +22,31 @@ import {
   setWhirlClock,
   turnPoint,
   whirlAngle,
-  satWorld,
-  shellRadii,
-  discRadius,
+  discPoint,
+  discLayout,
   DISC_OPEN,
+  DISC_ROLL,
   SETTLE_S,
   STEP,
-  visualSatellites,
 } from "./catalog";
 import { defaultWorldStats, defsFromWorlds, newSunId, newWorldId, separate, snapFormation, cohortFor, turnFor, clusterCircle, MAX_SUNS, MAX_SUN_SCALE, sunIdFromKey, sunKey, type GroupAnchor, type MapLock, type MapSun, type MapWorld, type RememberGroup, type RememberWorld } from "./maps";
+import { applyRocks, brushCells, FIELD_CELL, parseRock, rockDensity, rockIndex, rockKey, rockSpeck, ROCK_PACK, type RockBrush } from "./fields";
 import { hash3, rgb } from "./noise";
 import { massingPlanet } from "./ai";
 import { drawAtmosphere, drawRings, planetTexture } from "./planets-draw";
-import { craftDraw, match, satelliteOffset, setMotionReduced, sim, takeSparks } from "./sim";
+import { craftDraw, match, setMotionReduced, sim, takeSparks } from "./sim";
 import type { PlanetDef, Selection, SendTarget } from "./types";
 import { NEUTRAL_ID, PLAYER_ID } from "./types";
+
+type SelGroup = { x: number; y: number; r: number; worldIds: string[]; sunIds: string[] };
 
 type MapHist = {
   worlds: MapWorld[];
   suns: MapSun[];
+  rocks: string[];
   locks: MapLock[];
   selectedId: string | null;
-  group: { x: number; y: number; r: number; worldIds: string[]; sunIds: string[] } | null;
+  group: SelGroup | null;
 };
 
 const CAPTURE_GLOW: [number, number, number] = [214, 58, 52];
@@ -94,16 +97,19 @@ export class WorldView {
   editing = false;
   placing = true;
   placeSun = false;
+  rockBrush: RockBrush | null = null;
   placeOrbit = false;
   placeOwner: number | null = null;
   placeTemplate = 0;
   selecting = false;
   suns: MapSun[] = [];
+  rocks: string[] = [];
+  rockGhost: string[] | null = null;
   locks: MapLock[] = [];
   snap = false;
   worlds: MapWorld[] = [];
   selectedId: string | null = null;
-  onEdit: (worlds: MapWorld[], selectedId: string | null, suns: MapSun[], locks: MapLock[]) => void = () => {};
+  onEdit: (worlds: MapWorld[], selectedId: string | null, suns: MapSun[], locks: MapLock[], rocks: string[]) => void = () => {};
   onGroupLock: (lock: MapLock | null) => void = () => {};
   onHistory: (canUndo: boolean, canRedo: boolean) => void = () => {};
   onRemember: (draft: { worlds: RememberWorld[]; suns: RememberGroup["suns"] }) => void = () => {};
@@ -148,7 +154,7 @@ export class WorldView {
     lock?: "x" | "y" | "both";
   } | null = null;
   private editDrag: {
-    kind: "world" | "point" | "pan" | "sun" | "resize" | "hold" | "flat" | "marquee" | "gmove" | "gcopy" | "grotate" | "gspin" | "gcenter" | "gpivot";
+    kind: "world" | "point" | "pan" | "sun" | "rock" | "resize" | "hold" | "flat" | "marquee" | "gmove" | "gcopy" | "grotate" | "gspin" | "gcenter" | "gpivot";
     id?: string;
     pointer: number;
     lastX: number;
@@ -160,7 +166,7 @@ export class WorldView {
     wy?: number;
     ang?: number;
   } | null = null;
-  private group: { x: number; y: number; r: number; worldIds: string[]; sunIds: string[] } | null = null;
+  private group: SelGroup | null = null;
   private historyBase: MapHist | null = null;
   private undos: MapHist[] = [];
   private redos: MapHist[] = [];
@@ -195,11 +201,12 @@ export class WorldView {
     placing = this.placing,
     suns: MapSun[] | null = null,
     locks: MapLock[] | null = null,
+    rocks: string[] | null = null,
   ) {
     this.placing = placing;
     if (this.editDrag) return;
-    const incoming = JSON.stringify({ worlds, suns: suns ?? [], locks: locks ?? [] });
-    const current = JSON.stringify({ worlds: this.worlds, suns: this.suns, locks: this.locks });
+    const incoming = JSON.stringify({ worlds, suns: suns ?? [], locks: locks ?? [], rocks: rocks ?? [] });
+    const current = JSON.stringify({ worlds: this.worlds, suns: this.suns, locks: this.locks, rocks: this.rocks });
     if (incoming !== current) {
       this.undos = [];
       this.redos = [];
@@ -209,6 +216,7 @@ export class WorldView {
     this.worlds = worlds.map((w) => ({ ...w }));
     this.selectedId = selectedId;
     this.suns = (suns ?? []).map((s) => ({ ...s }));
+    this.rocks = (rocks ?? []).slice();
     this.locks = (locks ?? []).map((lock) => ({
       ...lock,
       worldIds: lock.worldIds.slice(),
@@ -220,6 +228,8 @@ export class WorldView {
     this.placing = placing;
     if (placing) {
       this.placeSun = false;
+      this.rockBrush = null;
+      this.rockGhost = null;
       this.selecting = false;
       this.clearGroup();
     }
@@ -229,6 +239,20 @@ export class WorldView {
     this.placeSun = on;
     if (on) {
       this.placing = false;
+      this.rockBrush = null;
+      this.rockGhost = null;
+      this.selecting = false;
+      this.clearGroup();
+    }
+  }
+
+  setRockBrush(brush: RockBrush | null) {
+    const was = this.rockBrush;
+    this.rockBrush = brush;
+    if (!brush) this.rockGhost = null;
+    if (brush && !was) {
+      this.placing = false;
+      this.placeSun = false;
       this.selecting = false;
       this.clearGroup();
     }
@@ -239,6 +263,8 @@ export class WorldView {
     if (on) {
       this.placing = false;
       this.placeSun = false;
+      this.rockBrush = null;
+      this.rockGhost = null;
     } else this.clearGroup();
   }
 
@@ -292,7 +318,7 @@ export class WorldView {
       maxY = Math.max(maxY, y + pad);
     };
     for (const d of defs) {
-      const rad = shellRadii(planetSize(d), d.level ?? 1).at(-1) ?? planetSize(d);
+      const rad = discLayout(d).radii.at(-1) ?? planetSize(d);
       if (d.still) add(d.anchorX ?? 0, d.anchorY ?? 0, rad + 10);
       else {
         const ax = d.anchorX ?? 0;
@@ -453,20 +479,26 @@ export class WorldView {
     for (const def of m.defs) {
       const st = m.planets[def.id];
       if (!st || st.owner !== PLAYER_ID || st.garrison < 1) continue;
-      const n = visualSatellites(st.garrison);
-      if (n < 1) continue;
-      let hit = 0;
-      for (let i = 0; i < n; i++) {
-        const s = satWorld(def, i, this.bodyTime(def.id), this.reduced);
-        const off = satelliteOffset(def.id, i);
-        if (Math.hypot(s.x + off.x - cx, s.y + off.y - cy) <= r) hit += 1;
-      }
       const pos = planetWorld(def, this.bodyTime(def.id), this.reduced);
-      if (Math.hypot(pos.x - cx, pos.y - cy) <= r) {
-        hit = Math.max(hit, Math.ceil(n * Math.min(1, r / (planetSize(def) + 18))));
+      const layout = discLayout(def);
+      const rings = layout.radii.slice(0, layout.current);
+      const steps = 24;
+      let cover = 0;
+      for (const radius of rings) {
+        let hit = 0;
+        for (let k = 0; k < steps; k++) {
+          const p = discPoint(pos.x, pos.y, radius, (k / steps) * Math.PI * 2);
+          if (Math.hypot(p.x - cx, p.y - cy) <= r) hit += 1;
+        }
+        cover += hit / steps;
       }
-      const amount = Math.floor((st.garrison * hit) / n);
-      if (amount >= 1) out[def.id] = amount;
+      let frac = rings.length > 0 ? cover / rings.length : 0;
+      if (Math.hypot(pos.x - cx, pos.y - cy) <= r) {
+        const outer = rings[rings.length - 1] ?? planetSize(def) + 18;
+        frac = Math.max(frac, Math.min(1, r / outer));
+      }
+      const amount = frac > 0 ? Math.max(1, Math.floor(st.garrison * frac)) : 0;
+      if (amount >= 1) out[def.id] = Math.min(st.garrison, amount);
     }
     return out;
   }
@@ -628,7 +660,12 @@ export class WorldView {
       this.worlds.map((w) => ({ ...w })),
       this.selectedId,
       this.suns.map((s) => ({ ...s })),
-      this.locks.map((lock) => ({ ...lock, worldIds: lock.worldIds.slice(), sunIds: lock.sunIds.slice() })),
+      this.locks.map((lock) => ({
+        ...lock,
+        worldIds: lock.worldIds.slice(),
+        sunIds: lock.sunIds.slice(),
+      })),
+      this.rocks.slice(),
     );
     this.onGroupLock(this.selectionLock());
   }
@@ -637,16 +674,30 @@ export class WorldView {
     return {
       worlds: this.worlds.map((w) => ({ ...w })),
       suns: this.suns.map((s) => ({ ...s })),
-      locks: this.locks.map((lock) => ({ ...lock, worldIds: lock.worldIds.slice(), sunIds: lock.sunIds.slice() })),
+      rocks: this.rocks.slice(),
+      locks: this.locks.map((lock) => ({
+        ...lock,
+        worldIds: lock.worldIds.slice(),
+        sunIds: lock.sunIds.slice(),
+      })),
       selectedId: this.selectedId,
       group: this.group
-        ? { x: this.group.x, y: this.group.y, r: this.group.r, worldIds: this.group.worldIds.slice(), sunIds: this.group.sunIds.slice() }
+        ? {
+            x: this.group.x,
+            y: this.group.y,
+            r: this.group.r,
+            worldIds: this.group.worldIds.slice(),
+            sunIds: this.group.sunIds.slice(),
+          }
         : null,
     };
   }
 
   private sameLayout(a: MapHist, b: MapHist) {
-    return JSON.stringify({ worlds: a.worlds, suns: a.suns, locks: a.locks }) === JSON.stringify({ worlds: b.worlds, suns: b.suns, locks: b.locks });
+    return (
+      JSON.stringify({ worlds: a.worlds, suns: a.suns, rocks: a.rocks, locks: a.locks }) ===
+      JSON.stringify({ worlds: b.worlds, suns: b.suns, rocks: b.rocks, locks: b.locks })
+    );
   }
 
   private noteHistory() {
@@ -673,10 +724,21 @@ export class WorldView {
   private applyHistory(snap: MapHist) {
     this.worlds = snap.worlds.map((w) => ({ ...w }));
     this.suns = snap.suns.map((s) => ({ ...s }));
-    this.locks = snap.locks.map((lock) => ({ ...lock, worldIds: lock.worldIds.slice(), sunIds: lock.sunIds.slice() }));
+    this.rocks = (snap.rocks ?? []).slice();
+    this.locks = snap.locks.map((lock) => ({
+      ...lock,
+      worldIds: lock.worldIds.slice(),
+      sunIds: lock.sunIds.slice(),
+    }));
     this.selectedId = snap.selectedId;
     this.group = snap.group
-      ? { x: snap.group.x, y: snap.group.y, r: snap.group.r, worldIds: snap.group.worldIds.slice(), sunIds: snap.group.sunIds.slice() }
+      ? {
+          x: snap.group.x,
+          y: snap.group.y,
+          r: snap.group.r,
+          worldIds: snap.group.worldIds.slice(),
+          sunIds: snap.group.sunIds.slice(),
+        }
       : null;
     this.historyBase = null;
     this.emitEdit();
@@ -714,6 +776,22 @@ export class WorldView {
 
   private editDown(e: PointerEvent) {
     this.beginHistory();
+    if (this.rockBrush && !this.selecting) {
+      const wpt = this.worldFromEvent(e);
+      this.editDrag = {
+        kind: "rock",
+        pointer: e.pointerId,
+        lastX: e.clientX,
+        lastY: e.clientY,
+        sx: e.clientX,
+        sy: e.clientY,
+        wx: wpt.x,
+        wy: wpt.y,
+        moved: false,
+      };
+      this.rockGhost = this.previewRocks(wpt.x, wpt.y, wpt.x, wpt.y, false);
+      return;
+    }
     if (this.selecting) {
       this.editSelectDown(e);
       return;
@@ -850,6 +928,11 @@ export class WorldView {
       this.emitEdit();
       return;
     }
+    if (drag.kind === "rock") {
+      const p = this.worldFromEvent(e);
+      this.rockGhost = this.previewRocks(drag.wx ?? p.x, drag.wy ?? p.y, p.x, p.y, drag.moved);
+      return;
+    }
     if (drag.kind === "pan") {
       this.camX -= (e.clientX - drag.lastX) / this.scale;
       this.camY -= (e.clientY - drag.lastY) / this.scale;
@@ -964,6 +1047,17 @@ export class WorldView {
     }
     if (drag.kind === "marquee") {
       this.finishMarquee(drag.moved);
+      this.emitEdit();
+      return;
+    }
+    if (drag.kind === "rock") {
+      const brush = this.rockBrush;
+      const p = this.worldFromEvent(e);
+      if (brush) {
+        const stamp = this.previewRocks(drag.wx ?? p.x, drag.wy ?? p.y, p.x, p.y, drag.moved);
+        this.rocks = applyRocks(this.rocks, stamp, brush.erase);
+      }
+      this.rockGhost = null;
       this.emitEdit();
       return;
     }
@@ -1282,6 +1376,7 @@ export class WorldView {
     this.drawStars();
     this.drawDust();
     this.drawOrbits();
+    this.drawFields();
     if (this.editing) {
       for (const sun of this.suns) this.drawSun(sun, this.selectedId === sunKey(sun.id));
     } else if (!this.hasCustomLayout()) {
@@ -1298,6 +1393,122 @@ export class WorldView {
     this.drawEditChrome();
     this.drawGroup();
     this.drawCircle();
+  }
+
+  private rockMagnet(x: number, y: number) {
+    if (!this.snap || this.rockBrush?.shape !== "ring") return null;
+    const best = { x: 0, y: 0, d: Infinity };
+    const reach = 180;
+    const consider = (px: number, py: number) => {
+      const d = Math.hypot(px - x, py - y);
+      if (d <= reach && d < best.d) {
+        best.x = px;
+        best.y = py;
+        best.d = d;
+      }
+    };
+    for (const world of this.worlds) {
+      const def = this.defs().find((item) => item.id === world.id);
+      const pos = def ? planetWorld(def, this.bodyTime(def.id), this.reduced) : world;
+      consider(pos.x, pos.y);
+    }
+    for (const sun of this.suns) consider(sun.x, sun.y);
+    return best.d < Infinity ? { x: best.x, y: best.y } : null;
+  }
+
+  private previewRocks(x0: number, y0: number, x1: number, y1: number, moved: boolean) {
+    const brush = this.rockBrush;
+    if (!brush) return [];
+    return brushCells(brush, x0, y0, x1, y1, moved, this.snap, this.rockMagnet(x0, y0));
+  }
+
+  private drawRock(
+    x: number,
+    y: number,
+    r: number,
+    speck: { rot: number; sides: number; tone: number; squash: number },
+    ghost: boolean,
+  ) {
+    const ctx = this.ctx;
+    const sides = Math.max(5, speck.sides);
+    ctx.beginPath();
+    for (let i = 0; i < sides; i++) {
+      const ang = speck.rot + (i / sides) * Math.PI * 2;
+      const jag = 0.7 + (Math.sin(speck.rot * 3 + i * 2.4) * 0.5 + 0.5) * 0.4;
+      const px = x + Math.cos(ang) * r * jag;
+      const py = y + Math.sin(ang) * r * jag * speck.squash;
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    const shade = Math.round(54 + speck.tone * 32);
+    if (ghost) ctx.globalAlpha = 0.5;
+    ctx.fillStyle = `rgb(${shade + 12}, ${shade + 6}, ${shade - 2})`;
+    ctx.fill();
+    ctx.lineWidth = Math.max(0.8, r * 0.18);
+    ctx.strokeStyle = "rgb(18, 16, 14)";
+    ctx.stroke();
+    const face = speck.rot + 0.5;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + Math.cos(face) * r * 0.42, y + Math.sin(face) * r * 0.42 * speck.squash);
+    ctx.lineTo(x + Math.cos(face + 1.15) * r * 0.34, y + Math.sin(face + 1.15) * r * 0.34 * speck.squash);
+    ctx.closePath();
+    ctx.fillStyle = `rgb(${shade + 28}, ${shade + 18}, ${shade + 6})`;
+    ctx.fill();
+    if (ghost) ctx.globalAlpha = 1;
+  }
+
+  private drawFields() {
+    const ctx = this.ctx;
+    const m = match();
+    const keys = this.editing ? this.rocks : (m?.sourceMap?.rocks ?? []);
+    const ghost = this.editing ? (this.rockGhost ?? []) : [];
+    if (!keys.length && !ghost.length) return;
+    const wear = this.editing ? undefined : m?.fieldWear;
+    const rocks = rockIndex(keys);
+    const halfW = this.w / (2 * Math.max(0.2, this.scale)) + FIELD_CELL * 2;
+    const halfH = this.h / (2 * Math.max(0.2, this.scale)) + FIELD_CELL * 2;
+    const paint = (key: string, ghosting: boolean) => {
+      const rock = parseRock(key);
+      if (!rock) return;
+      const { ix, iy } = rock;
+      const cx = (ix + 0.5) * FIELD_CELL;
+      const cy = (iy + 0.5) * FIELD_CELL;
+      if (Math.abs(cx - this.camX) > halfW || Math.abs(cy - this.camY) > halfH) return;
+      if (ghosting && this.rockBrush?.erase) {
+        const cell = Math.max(1, FIELD_CELL * this.scale);
+        const center = this.worldToScreen(cx, cy);
+        ctx.fillStyle = "rgba(196, 92, 82, 0.35)";
+        ctx.fillRect(center.x - cell / 2, center.y - cell / 2, cell, cell);
+      }
+    };
+    const stones = (key: string, ghosting: boolean) => {
+      const rock = parseRock(key);
+      if (!rock) return;
+      const { ix, iy } = rock;
+      const cx = (ix + 0.5) * FIELD_CELL;
+      const cy = (iy + 0.5) * FIELD_CELL;
+      if (Math.abs(cx - this.camX) > halfW || Math.abs(cy - this.camY) > halfH) return;
+      const density = ghosting ? Math.min(1, 0.55 * (rock.pack / ROCK_PACK)) : rockDensity(wear, rocks, ix, iy);
+      if (density <= 0.05) return;
+      const pack = ghosting ? rock.pack : (rocks.get(rockKey(ix, iy)) ?? rock.pack);
+      for (const speck of rockSpeck(ix, iy, density, pack)) {
+        const s = this.worldToScreen(speck.x, speck.y);
+        this.drawRock(s.x, s.y, Math.max(1.6, speck.s * this.scale), speck, ghosting);
+      }
+    };
+    for (const key of keys) stones(key, false);
+    for (const key of ghost) {
+      const rock = parseRock(key);
+      if (!rock) continue;
+      const id = rockKey(rock.ix, rock.iy);
+      const prev = rocks.get(id);
+      const show = this.rockBrush?.erase ? prev != null : prev == null || prev !== rock.pack;
+      if (!show) continue;
+      if (this.rockBrush?.erase) paint(key, true);
+      else stones(key, true);
+    }
   }
 
   private hasCustomLayout() {
@@ -1593,13 +1804,14 @@ export class WorldView {
     const worlds = new Set(this.group.worldIds);
     const suns = new Set(this.group.sunIds);
     return (
-      this.locks.find(
-        (lock) =>
+      this.locks.find((lock) => {
+        return (
           lock.worldIds.length === worlds.size &&
           lock.sunIds.length === suns.size &&
           lock.worldIds.every((id) => worlds.has(id)) &&
-          lock.sunIds.every((id) => suns.has(id)),
-      ) ?? null
+          lock.sunIds.every((id) => suns.has(id))
+        );
+      }) ?? null
     );
   }
 
@@ -1648,7 +1860,13 @@ export class WorldView {
       this.group = null;
       return;
     }
-    this.group = { x: circle.x, y: circle.y, r: circle.r, worldIds: worldIds.slice(), sunIds: sunIds.slice() };
+    this.group = {
+      x: circle.x,
+      y: circle.y,
+      r: circle.r,
+      worldIds: worldIds.slice(),
+      sunIds: sunIds.slice(),
+    };
     this.selectedId = null;
     const lock = this.selectionLock();
     this.spinOn = Boolean(lock?.turn);
@@ -1727,7 +1945,19 @@ export class WorldView {
     const circle = clusterCircle(this.worlds, this.suns, worldIds, sunIds);
     this.locks = [
       ...this.locks,
-      { id: `k${Date.now().toString(36)}`, worldIds, sunIds, orbit: false, ox: circle.x - 140, oy: circle.y, spin: 0.12, turn: false, cx: circle.x, cy: circle.y, pspin: 1 },
+      {
+        id: `k${Date.now().toString(36)}`,
+        worldIds,
+        sunIds,
+        orbit: false,
+        ox: circle.x - 140,
+        oy: circle.y,
+        spin: 0.12,
+        turn: false,
+        cx: circle.x,
+        cy: circle.y,
+        pspin: 1,
+      },
     ];
     this.poseGroup(worldIds, sunIds);
     this.emitEdit();
@@ -2013,13 +2243,14 @@ export class WorldView {
     }
     const expanded = this.expandLocks(worldIds, sunIds);
     const grew = expanded.worldIds.length !== worldIds.length || expanded.sunIds.length !== sunIds.length;
-    const matched = this.locks.some(
-      (lock) =>
+    const matched = this.locks.some((lock) => {
+      return (
         lock.worldIds.length === expanded.worldIds.length &&
         lock.sunIds.length === expanded.sunIds.length &&
         lock.worldIds.every((id) => expanded.worldIds.includes(id)) &&
-        lock.sunIds.every((id) => expanded.sunIds.includes(id)),
-    );
+        lock.sunIds.every((id) => expanded.sunIds.includes(id))
+      );
+    });
     if (grew || matched) this.poseGroup(expanded.worldIds, expanded.sunIds);
     else this.group = { x: area.x, y: area.y, r: area.r, worldIds, sunIds };
     this.selectedId = null;
@@ -2145,6 +2376,8 @@ export class WorldView {
     this.selecting = true;
     this.placing = false;
     this.placeSun = false;
+    this.rockBrush = null;
+    this.rockGhost = null;
     this.emitEdit();
     this.commitHistory();
   }
@@ -2465,12 +2698,14 @@ export class WorldView {
     const factions = this.editing ? [PLAYER_FACTION, ...AI_FACTIONS] : (m?.factions ?? []);
     const col = factionColor(owner, factions);
     const owned = owner !== NEUTRAL_ID;
-    const showDisc = this.editing || garrison > 0;
-
-    if (showDisc) {
-      this.drawDisc(def, s.x, s.y, false);
-      this.drawSatellites(def, owner, garrison, col, false);
-    }
+    const ready =
+      !this.editing &&
+      !!st &&
+      owner !== NEUTRAL_ID &&
+      (st.level || 1) < (def.maxLevel ?? MAX_LEVEL) &&
+      (st.release ?? 0) <= 0 &&
+      st.garrison >= Math.max(1, worldRise(def, st.level || 1) - (st.upgrade ?? 0));
+    this.drawDisc(def, s.x, s.y, false, garrison, col, ready);
 
     if (def.rings) drawRings(ctx, s.x, s.y, r, this.time, false);
     drawAtmosphere(ctx, s.x, s.y, r, def.palette.atmo, owned, owned ? col : undefined);
@@ -2540,14 +2775,6 @@ export class WorldView {
       }
     }
 
-    const ready =
-      !this.editing &&
-      !!st &&
-      owner !== NEUTRAL_ID &&
-      (st.level || 1) < (def.maxLevel ?? MAX_LEVEL) &&
-      (st.release ?? 0) <= 0 &&
-      st.garrison >= Math.max(1, worldRise(def, st.level || 1) - (st.upgrade ?? 0));
-
     if (this.picked[id]) {
       ctx.beginPath();
       ctx.arc(s.x, s.y, r + 9 + Math.sin(this.time * 3) * 1.4, 0, Math.PI * 2);
@@ -2576,15 +2803,7 @@ export class WorldView {
     }
 
     if (def.rings) drawRings(ctx, s.x, s.y, r, this.time, true);
-    const cap = this.editing ? (def.level ?? 1) : (def.maxLevel ?? def.level ?? MAX_LEVEL);
-    const current = this.editing ? 1 : (st?.level || def.level || 1);
-    const steps = Math.max(0, cap - current);
-    this.drawUpgradeRings(s.x, s.y, r, steps);
-    if (ready) this.drawReadyGlow(s.x, s.y, this.upgradeOuter(r, Math.max(1, steps)));
-    if (showDisc) {
-      this.drawDisc(def, s.x, s.y, true);
-      this.drawSatellites(def, owner, garrison, col, true);
-    }
+    this.drawDisc(def, s.x, s.y, true, garrison, col, ready);
   }
 
   private drawCorona(
@@ -2625,77 +2844,97 @@ export class WorldView {
     ctx.restore();
   }
 
-  private drawDisc(def: PlanetDef, x: number, y: number, front: boolean) {
+  private drawDisc(
+    def: PlanetDef,
+    x: number,
+    y: number,
+    front: boolean,
+    garrison: number,
+    col: [number, number, number],
+    ready: boolean,
+  ) {
     const ctx = this.ctx;
-    const rad = discRadius(planetSize(def), def.level ?? 1) * this.scale;
-    const ry = Math.max(0.75, rad * DISC_OPEN);
-    ctx.beginPath();
-    ctx.ellipse(x, y, rad, ry, 0, front ? 0 : Math.PI, front ? Math.PI : Math.PI * 2);
-    ctx.strokeStyle = front ? "rgba(236,236,239,0.28)" : "rgba(236,236,239,0.1)";
-    ctx.lineWidth = 1;
-    ctx.stroke();
-  }
-
-  private upgradeOuter(r: number, count: number) {
-    const hug = 7;
-    const gap = 5;
-    return r + hug + Math.max(0, count - 1) * gap;
-  }
-
-  private drawUpgradeRings(x: number, y: number, r: number, count: number) {
-    if (count < 1) return;
-    const ctx = this.ctx;
+    const layout = discLayout(def);
+    const rings = layout.radii;
+    const current = layout.current;
+    const load = garrison > 0 ? 1 - Math.exp(-garrison / (36 * current)) : 0;
+    const glow = load <= 0 ? 0 : 0.06 + 0.94 * load;
+    const picked = this.picked[def.id] ?? 0;
+    const held = garrison > 0 ? Math.min(1, picked / garrison) : 0;
+    const halfPx = Math.max(3.1 * this.scale, 3.4);
+    const open = DISC_OPEN;
+    const wave = ready ? 0.5 + 0.5 * Math.sin(this.preview * ((2 * Math.PI * 50) / 60)) : 0;
     ctx.save();
-    for (let i = 0; i < count; i++) {
+    ctx.translate(x, y);
+    ctx.rotate(DISC_ROLL);
+    ctx.beginPath();
+    const span = 8000;
+    if (front) ctx.rect(-span, 0, span * 2, span);
+    else ctx.rect(-span, -span, span * 2, span);
+    ctx.clip();
+    for (let i = 0; i < rings.length; i++) {
+      const rad = rings[i] * this.scale;
+      const live = i < current;
+      const next = i === current;
+      const outer = rad + halfPx;
+      const inner = Math.max(0.35, rad - halfPx);
+      const oy = Math.max(0.3, outer * open);
+      const iy = Math.max(0.25, inner * open);
+      if (live && glow > 0) {
+        ctx.beginPath();
+        ctx.ellipse(0, 0, outer, oy, 0, 0, Math.PI * 2);
+        ctx.ellipse(0, 0, inner, iy, 0, 0, Math.PI * 2);
+        const face = front ? 1 : 0.4;
+        ctx.fillStyle = rgb(col, Math.min(1, glow * face));
+        ctx.fill("evenodd");
+        const hot = load * load;
+        if (hot > 0.05) {
+          ctx.fillStyle = `rgba(255,248,236,${hot * (front ? 0.7 : 0.18)})`;
+          ctx.fill("evenodd");
+        }
+        if (held > 0.02) {
+          ctx.fillStyle = `rgba(248,250,252,${(front ? 0.8 : 0.35) * held})`;
+          ctx.fill("evenodd");
+        }
+        if (ready) {
+          ctx.fillStyle = `rgba(255,226,170,${(front ? 0.06 : 0.02) + (front ? 0.5 : 0.16) * wave})`;
+          ctx.fill("evenodd");
+        }
+      }
+      const edge = live
+        ? Math.min(1, (front ? 0.4 : 0.12) + glow * (front ? 0.6 : 0.22) + (ready ? (front ? 0.4 : 0.14) * wave : 0))
+        : next && ready
+          ? (front ? 0.2 : 0.07) + (front ? 0.55 : 0.2) * wave
+          : front
+            ? 0.2
+            : 0.07;
       ctx.beginPath();
-      ctx.arc(x, y, this.upgradeOuter(r, i + 1), 0, Math.PI * 2);
-      ctx.strokeStyle = `rgba(236, 214, 170, ${0.95 - i * 0.1})`;
-      ctx.lineWidth = 1.4;
+      ctx.ellipse(0, 0, rad, Math.max(0.55, rad * open), 0, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(236,236,239,${edge})`;
+      ctx.lineWidth = 1;
       ctx.stroke();
     }
     ctx.restore();
   }
 
-  private drawReadyGlow(x: number, y: number, edge: number) {
+  private drawSeed(x: number, y: number, rot: number, fill: string, big: boolean) {
     const ctx = this.ctx;
-    const wave = 0.5 + 0.5 * Math.sin(this.preview * ((2 * Math.PI * 50) / 60));
-    const inner = edge + 2;
-    const outer = edge + 14 + 6 * wave;
-    const g = ctx.createRadialGradient(x, y, inner, x, y, outer);
-    g.addColorStop(0, `rgba(255, 214, 150, ${0.2 + 0.16 * wave})`);
-    g.addColorStop(1, "rgba(255, 214, 150, 0)");
+    const len = big ? 3.15 : 2.55;
+    const wid = big ? 1.35 : 1.05;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rot);
     ctx.beginPath();
-    ctx.arc(x, y, outer, 0, Math.PI * 2);
-    ctx.arc(x, y, inner, 0, Math.PI * 2, true);
-    ctx.fillStyle = g;
+    ctx.moveTo(len, 0);
+    ctx.quadraticCurveTo(len * 0.15, wid, -len * 0.65, 0);
+    ctx.quadraticCurveTo(len * 0.15, -wid, len, 0);
+    ctx.closePath();
+    ctx.fillStyle = fill;
     ctx.fill();
-  }
-
-  private drawSatellites(def: PlanetDef, owner: number, garrison: number, col: [number, number, number], front: boolean) {
-    const ctx = this.ctx;
-    const n = visualSatellites(garrison);
-    const picked = this.picked[def.id] ?? 0;
-    const pickedDots = n < 1 || garrison < 1 ? 0 : Math.round((picked / garrison) * n);
-    const dots: { i: number; x: number; y: number; near: number }[] = [];
-    for (let i = 0; i < n; i++) {
-      const w = satWorld(def, i, this.bodyTime(def.id), this.reduced);
-      if ((w.near >= 0) !== front) continue;
-      const off = satelliteOffset(def.id, i);
-      const p = this.worldToScreen(w.x + off.x, w.y + off.y);
-      dots.push({ i, x: p.x, y: p.y, near: w.near });
-    }
-    dots.sort((a, b) => a.near - b.near);
-    for (const dot of dots) {
-      const selected = dot.i < pickedDots;
-      const size = selected ? 2.7 : 2.15;
-      ctx.beginPath();
-      ctx.arc(dot.x, dot.y, size, 0, Math.PI * 2);
-      ctx.fillStyle = selected ? "rgba(248,250,252,0.98)" : rgb(col, front ? 1 : 0.55);
-      ctx.fill();
-      ctx.lineWidth = 1;
-      ctx.strokeStyle = "rgba(6,8,12,0.8)";
-      ctx.stroke();
-    }
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = "rgba(6,8,12,0.85)";
+    ctx.stroke();
+    ctx.restore();
   }
 
   private drawCrafts() {
@@ -2710,6 +2949,7 @@ export class WorldView {
       const sp = Math.hypot(c.vx, c.vy) || 1;
       const len = 9 + Math.min(8, c.payload);
       const hot = this.pickedCrafts.includes(c.id);
+      const rot = Math.atan2(c.vy, c.vx);
       if (!c.hold && (c.vx !== 0 || c.vy !== 0)) {
         ctx.strokeStyle = hot ? "rgba(236,236,239,0.9)" : rgb(col, 0.4);
         ctx.lineWidth = 1;
@@ -2725,13 +2965,7 @@ export class WorldView {
         ctx.lineWidth = 1;
         ctx.stroke();
       }
-      ctx.fillStyle = hot ? "rgba(248,250,252,0.98)" : rgb(col, 1);
-      ctx.beginPath();
-      ctx.arc(s.x, s.y, hot ? 3.1 : c.payload > 3 ? 2.6 : 2.05, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.lineWidth = 1;
-      ctx.strokeStyle = "rgba(6,8,12,0.8)";
-      ctx.stroke();
+      this.drawSeed(s.x, s.y, rot, hot ? "rgba(248,250,252,0.98)" : rgb(col, 1), hot || c.payload > 3);
     }
   }
 

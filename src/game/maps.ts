@@ -12,6 +12,7 @@ import {
 } from "./catalog";
 import type { Cohort, Faction, PlanetDef, PlanetLevel, SetupConfig, Skill } from "./types";
 import { NEUTRAL_ID, PLAYER_ID } from "./types";
+import { MAX_ROCKS, legacyCircleRocks, parseRock, rockKey, rocksFromIndex } from "./fields";
 
 export const MAPS_KEY = "helion.maps.v1";
 export const LIBRARY_KEY = "helion.library.v1";
@@ -134,6 +135,8 @@ export type CustomMap = {
   worlds: MapWorld[];
   /** Placed stars, at most five. Omitted maps have none. */
   suns?: MapSun[];
+  /** Painted asteroid cells, "ix:iy" on the rock grid. Omitted maps have none. */
+  rocks?: string[];
   /** Clusters locked together. Omitted maps have none. */
   locks?: MapLock[];
 };
@@ -482,9 +485,11 @@ export function turnFor(
   id: string,
 ): { ox: number; oy: number; spin: number } | null {
   if (!locks?.length || !id) return null;
-  const lock = locks.find(
-    (item) => item.turn && (kind === "world" ? item.worldIds.includes(id) : item.sunIds.includes(id)),
-  );
+  const lock = locks.find((item) => {
+    if (!item.turn) return false;
+    if (kind === "world") return item.worldIds.includes(id);
+    return item.sunIds.includes(id);
+  });
   if (!lock) return null;
   const pace = typeof lock.pspin === "number" && Number.isFinite(lock.pspin) ? lock.pspin : 1;
   return { ox: lock.cx, oy: lock.cy, spin: pace * 0.8 };
@@ -498,9 +503,11 @@ export function cohortFor(
   id: string,
 ): Cohort | null {
   if (!locks?.length || !id) return null;
-  const lock = locks.find(
-    (item) => item.orbit && (kind === "world" ? item.worldIds.includes(id) : item.sunIds.includes(id)),
-  );
+  const lock = locks.find((item) => {
+    if (!item.orbit) return false;
+    if (kind === "world") return item.worldIds.includes(id);
+    return item.sunIds.includes(id);
+  });
   if (!lock) return null;
   const circle = clusterCircle(worlds, suns, lock.worldIds, lock.sunIds);
   if (circle.r < 1) return null;
@@ -716,6 +723,7 @@ function sanitizeMap(raw: unknown, index: number): CustomMap | null {
     })
     .filter((s): s is MapSun => Boolean(s))
     .slice(0, MAX_SUNS);
+  const rocks = sanitizeRocks(m);
   const worldIds = new Set(worlds.map((w) => w.id));
   const sunIds = new Set(suns.map((s) => s.id));
   const locks = Array.isArray(m.locks)
@@ -729,8 +737,33 @@ function sanitizeMap(raw: unknown, index: number): CustomMap | null {
     skill,
     worlds,
     ...(suns.length ? { suns } : {}),
+    ...(rocks.length ? { rocks } : {}),
     ...(locks.length ? { locks } : {}),
   };
+}
+
+function sanitizeRocks(m: Partial<CustomMap> & { fields?: unknown }): string[] {
+  const index = new Map<string, number>();
+  const take = (key: string) => {
+    const rock = parseRock(key);
+    if (!rock) return;
+    const id = rockKey(rock.ix, rock.iy);
+    if (!index.has(id) && index.size >= MAX_ROCKS) return;
+    index.set(id, rock.pack);
+  };
+  if (Array.isArray(m.rocks)) {
+    for (const key of m.rocks) if (typeof key === "string") take(key);
+  }
+  if (!index.size && Array.isArray(m.fields)) {
+    for (const raw of m.fields) {
+      if (!raw || typeof raw !== "object") continue;
+      const f = raw as { x?: unknown; y?: unknown; r?: unknown };
+      if (typeof f.x !== "number" || typeof f.y !== "number" || !Number.isFinite(f.x) || !Number.isFinite(f.y)) continue;
+      const r = typeof f.r === "number" && Number.isFinite(f.r) ? f.r : 120;
+      for (const key of legacyCircleRocks(f.x, f.y, r)) take(key);
+    }
+  }
+  return rocksFromIndex(index);
 }
 
 function sanitizeLock(raw: unknown, worldIds: Set<string>, sunIds: Set<string>): MapLock | null {
